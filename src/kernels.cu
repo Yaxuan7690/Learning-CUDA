@@ -23,6 +23,12 @@ __host__ __device__ half from_float<half>(float x) {
   return __float2half(x);
 }
 
+__device__ float rcp_rn(float x) {
+  float y;
+  asm("rcp.rn.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
 template <typename T>
 __global__ void rms_norm_kernel(const T* input, const T* weight, T* output,
                                 size_t rows, size_t hidden_dim, float eps) {
@@ -63,7 +69,7 @@ __global__ void attention_kernel(const T* q, const T* k, const T* v, T* o,
                                  int src_seq_len, int query_heads,
                                  int kv_heads, int head_dim, bool is_causal) {
   float q_local[2048];
-  float scores[2048];
+  float out_local[2048];
 
   const int vec = blockIdx.x * blockDim.x + threadIdx.x;
   const int qh = vec % query_heads;
@@ -87,7 +93,6 @@ __global__ void attention_kernel(const T* q, const T* k, const T* v, T* o,
   float max_score = -INFINITY;
   for (int s = 0; s < src_seq_len; ++s) {
     const bool masked = is_causal && s > t;
-    float score = -INFINITY;
     if (!masked) {
       float dot = 0.0f;
       for (int d = 0; d < head_dim; ++d) {
@@ -97,33 +102,59 @@ __global__ void attention_kernel(const T* q, const T* k, const T* v, T* o,
             d;
         dot = fmaf(q_local[d], to_float(k[k_idx]), dot);
       }
-      score = dot * scale;
+      max_score = fmaxf(max_score, dot * scale);
     }
-    scores[s] = score;
-    max_score = fmaxf(max_score, score);
   }
 
   float denom = 0.0f;
   for (int s = 0; s < src_seq_len; ++s) {
-    denom += expf(scores[s] - max_score);
+    const bool masked = is_causal && s > t;
+    if (!masked) {
+      float dot = 0.0f;
+      for (int d = 0; d < head_dim; ++d) {
+        const size_t k_idx =
+            (((static_cast<size_t>(b) * src_seq_len + s) * kv_heads + kvh) *
+             head_dim) +
+            d;
+        dot = fmaf(q_local[d], to_float(k[k_idx]), dot);
+      }
+      denom += expf(dot * scale - max_score);
+    }
+  }
+
+  for (int d = 0; d < head_dim; ++d) {
+    out_local[d] = 0.0f;
   }
 
   const float inv_denom = rcp_rn(denom);
-  for (int d = 0; d < head_dim; ++d) {
-    float acc = 0.0f;
-    for (int s = 0; s < src_seq_len; ++s) {
-      const float p = expf(scores[s] - max_score) * inv_denom;
+  for (int s = 0; s < src_seq_len; ++s) {
+    const bool masked = is_causal && s > t;
+    if (!masked) {
+      float dot = 0.0f;
+      for (int d = 0; d < head_dim; ++d) {
+        const size_t k_idx =
+            (((static_cast<size_t>(b) * src_seq_len + s) * kv_heads + kvh) *
+             head_dim) +
+            d;
+        dot = fmaf(q_local[d], to_float(k[k_idx]), dot);
+      }
+      const float p = expf(dot * scale - max_score) * inv_denom;
+      for (int d = 0; d < head_dim; ++d) {
       const size_t v_idx =
           (((static_cast<size_t>(b) * src_seq_len + s) * kv_heads + kvh) *
            head_dim) +
           d;
-      acc = fmaf(p, to_float(v[v_idx]), acc);
+      out_local[d] = fmaf(p, to_float(v[v_idx]), out_local[d]);
+      }
     }
+  }
+
+  for (int d = 0; d < head_dim; ++d) {
     const size_t o_idx =
         (((static_cast<size_t>(b) * target_seq_len + t) * query_heads + qh) *
          head_dim) +
         d;
-    o[o_idx] = from_float<T>(acc);
+    o[o_idx] = from_float<T>(out_local[d]);
   }
 }
 
@@ -141,14 +172,6 @@ void copy_from_device(std::vector<T>& dst, const T* src) {
 }
 
 }  // namespace
-
-template <typename T>
-__global__ void ref_flash_attention_kernel(const T* q, const T* k, const T* v,
-                                           T* o, int batch_size,
-                                           int target_seq_len,
-                                           int src_seq_len, int query_heads,
-                                           int kv_heads, int head_dim,
-                                           bool is_causal);
 
 /**
  * @brief Computes RMSNorm over the last dimension of a 2D tensor.
@@ -223,7 +246,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   const int total = batch_size * target_seq_len * query_heads;
   const int blocks = (total + kBlockSize - 1) / kBlockSize;
   RUNTIME_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 65536));
-  ref_flash_attention_kernel<T><<<blocks, kBlockSize>>>(
+  attention_kernel<T><<<blocks, kBlockSize>>>(
       d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len, query_heads,
       kv_heads, head_dim, is_causal);
   RUNTIME_CHECK(cudaGetLastError());
